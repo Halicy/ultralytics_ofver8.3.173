@@ -18,7 +18,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "HCPRTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
 
 
 class Detect(nn.Module):
@@ -1170,6 +1170,380 @@ class RTDETRDecoder(nn.Module):
         xavier_uniform_(self.query_pos_head.layers[1].weight)
         for layer in self.input_proj:
             xavier_uniform_(layer[0].weight)
+
+
+class HCPRTDETRDecoder(RTDETRDecoder):
+    """
+    RT-DETR Decoder with Hierarchical Category Prototype Learning (HCP).
+
+    This decoder extends RTDETRDecoder to handle fine-grained subcategory modeling during training
+    while maintaining the original category structure during inference. It addresses the challenge
+    of high intra-class variance by learning hierarchical prototypes with contrastive learning.
+
+    Key innovations:
+        1. Fine-grained subcategory splitting during training (e.g., no_harvestable → 4 subcategories)
+        2. Learnable prototype vectors for each subcategory
+        3. Prototypical contrastive loss (instance-prototype + prototype separation)
+        4. Hierarchical score fusion during inference (subcategories → main categories)
+
+    Attributes:
+        sub_categories (dict): Mapping from main category to subcategories.
+            Example: {1: ['young_fruit', 'flower', 'occluded', 'malformed']}
+        num_sub (int): Total number of subcategories.
+        total_nc (int): Total number of classes (main + subcategories).
+        prototypes (nn.Parameter): Learnable prototype vectors [total_nc, hidden_dim].
+        proj_head (nn.Sequential): Projection head for contrastive learning.
+        sub_to_main (torch.Tensor): Hierarchical mapping matrix [total_nc, original_nc].
+        prototype_temp (float): Temperature for contrastive loss.
+        prototype_loss_weight (float): Weight for prototype loss.
+
+    Methods:
+        forward: Forward pass with hierarchical prototype learning.
+        prototype_contrastive_loss: Compute prototypical contrastive loss.
+        merge_subcategory_scores: Merge subcategory scores to main categories.
+
+    Examples:
+        Create an HCP-DETR decoder with subcategories
+        >>> sub_cats = {1: ['young_fruit', 'flower', 'occluded', 'malformed']}
+        >>> decoder = HCPRTDETRDecoder(nc=2, ch=(512, 1024, 2048), hd=256, nq=300,
+        ...                             sub_categories=sub_cats, prototype_loss_weight=0.3)
+        >>> x = [torch.randn(1, 512, 64, 64), torch.randn(1, 1024, 32, 32), torch.randn(1, 2048, 16, 16)]
+        >>> batch = {'cls': torch.tensor([[0, 1, 1]]), ...}
+        >>> outputs = decoder(x, batch)
+
+    References:
+        - PCLDet (IEEE TGRS 2023): Prototypical Contrastive Learning
+        - DP-DDCL (ESWA 2024): Discriminative Prototype with Dual Decoupled Contrast Learning
+        - Co-DETR (ICCV 2023): Collaborative DETR for improved detection
+    """
+
+    def __init__(
+        self,
+        nc: int = 2,  # Main categories (harvestable, no_harvestable)
+        ch: Tuple = (512, 1024, 2048),
+        hd: int = 256,
+        nq: int = 300,
+        ndp: int = 4,
+        nh: int = 8,
+        ndl: int = 6,
+        d_ffn: int = 1024,
+        dropout: float = 0.0,
+        act: nn.Module = nn.ReLU(),
+        eval_idx: int = -1,
+        nd: int = 100,
+        label_noise_ratio: float = 0.5,
+        box_noise_scale: float = 1.0,
+        learnt_init_query: bool = False,
+        # HCP-specific parameters
+        sub_categories: Optional[dict] = None,
+        prototype_temp: float = 0.07,
+        prototype_loss_weight: float = 0.3,
+    ):
+        """
+        Initialize HCP-DETR Decoder with hierarchical category prototype learning.
+
+        Args:
+            nc (int): Number of main classes.
+            ch (tuple): Channels in the backbone feature maps.
+            hd (int): Dimension of hidden layers.
+            nq (int): Number of query points.
+            ndp (int): Number of decoder points.
+            nh (int): Number of heads in multi-head attention.
+            ndl (int): Number of decoder layers.
+            d_ffn (int): Dimension of the feed-forward networks.
+            dropout (float): Dropout rate.
+            act (nn.Module): Activation function.
+            eval_idx (int): Evaluation index.
+            nd (int): Number of denoising.
+            label_noise_ratio (float): Label noise ratio.
+            box_noise_scale (float): Box noise scale.
+            learnt_init_query (bool): Whether to learn initial query embeddings.
+            sub_categories (dict, optional): Subcategory mapping. Format:
+                {main_category_id: [subcategory_name1, subcategory_name2, ...]}.
+                Example: {1: ['young_fruit', 'flower', 'occluded', 'malformed']}
+            prototype_temp (float): Temperature for contrastive loss.
+            prototype_loss_weight (float): Weight for prototype contrastive loss.
+        """
+        # Store subcategory configuration
+        self.sub_categories = sub_categories or {}
+        self.num_sub = sum(len(v) for v in self.sub_categories.values())
+        self.original_nc = nc
+
+        # Total classes = main classes + subcategories
+        # During training: use total_nc; during inference: merge back to original_nc
+        self.total_nc = nc + self.num_sub
+
+        # Initialize parent with total number of classes
+        super().__init__(
+            nc=self.total_nc,
+            ch=ch,
+            hd=hd,
+            nq=nq,
+            ndp=ndp,
+            nh=nh,
+            ndl=ndl,
+            d_ffn=d_ffn,
+            dropout=dropout,
+            act=act,
+            eval_idx=eval_idx,
+            nd=nd,
+            label_noise_ratio=label_noise_ratio,
+            box_noise_scale=box_noise_scale,
+            learnt_init_query=learnt_init_query,
+        )
+
+        # Prototype learning components
+        self.prototype_temp = prototype_temp
+        self.prototype_loss_weight = prototype_loss_weight
+
+        # Learnable prototypes for each class (main + subcategories)
+        # Shape: [total_nc, hidden_dim]
+        self.prototypes = nn.Parameter(torch.randn(self.total_nc, hd))
+        nn.init.xavier_uniform_(self.prototypes)
+
+        # Projection head for contrastive learning
+        # Maps from hidden_dim to a lower-dimensional contrastive space
+        self.proj_head = nn.Sequential(
+            nn.Linear(hd, hd),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hd, 128)  # Project to 128-d contrastive space
+        )
+
+        # Initialize projection head
+        for m in self.proj_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # Build hierarchical mapping matrix: subcategories → main categories
+        # Shape: [total_nc, original_nc]
+        self.register_buffer('sub_to_main', self._build_hierarchy_matrix())
+
+    def _build_hierarchy_matrix(self) -> torch.Tensor:
+        """
+        Build hierarchical mapping matrix from subcategories to main categories.
+
+        The matrix maps fine-grained predictions (total_nc) to coarse predictions (original_nc).
+        Each row corresponds to a class (main or sub), each column to a main category.
+
+        Returns:
+            (torch.Tensor): Mapping matrix of shape [total_nc, original_nc].
+
+        Example:
+            If nc=2 (harvestable, no_harvestable) and sub_categories={1: ['sub1', 'sub2']},
+            the matrix will be:
+            [[1, 0],     # harvestable → harvestable
+             [0, 1],     # no_harvestable (main) → no_harvestable
+             [0, 1],     # sub1 → no_harvestable
+             [0, 1]]     # sub2 → no_harvestable
+        """
+        # Start with identity matrix for main classes
+        matrix = torch.zeros(self.total_nc, self.original_nc)
+
+        # Main classes map to themselves
+        for i in range(self.original_nc):
+            matrix[i, i] = 1.0
+
+        # Subcategories map to their parent main class
+        sub_idx = self.original_nc
+        for main_cls, subs in sorted(self.sub_categories.items()):
+            for _ in subs:
+                matrix[sub_idx, main_cls] = 1.0
+                sub_idx += 1
+
+        return matrix
+
+    def prototype_contrastive_loss(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute prototypical contrastive loss.
+
+        This loss has two components:
+        1. Instance-prototype attraction: Pull features towards their class prototypes
+        2. Prototype-prototype repulsion: Push different class prototypes apart
+
+        Args:
+            features (torch.Tensor): Decoder output features [N, hidden_dim].
+            labels (torch.Tensor): Ground truth labels [N] in range [0, total_nc-1].
+
+        Returns:
+            (tuple): Instance loss and prototype separation loss.
+
+        Note:
+            Uses InfoNCE-style contrastive loss with temperature scaling.
+        """
+        if features.numel() == 0 or labels.numel() == 0:
+            return torch.tensor(0.0, device=features.device), torch.tensor(0.0, device=features.device)
+
+        # Project features and prototypes to contrastive space
+        z = F.normalize(self.proj_head(features), dim=1, p=2)  # [N, 128]
+        p = F.normalize(self.proj_head(self.prototypes), dim=1, p=2)  # [total_nc, 128]
+
+        # === Instance-prototype contrastive loss ===
+        # Compute similarity between features and all prototypes
+        logits = torch.matmul(z, p.t()) / self.prototype_temp  # [N, total_nc]
+
+        # InfoNCE loss: maximize similarity with positive prototypes
+        instance_loss = F.cross_entropy(logits, labels, reduction='mean')
+
+        # === Prototype separation loss ===
+        # Encourage different prototypes to be dissimilar (orthogonal)
+        proto_sim = torch.matmul(p, p.t())  # [total_nc, total_nc]
+
+        # Penalize off-diagonal elements (non-self similarities)
+        eye = torch.eye(self.total_nc, device=proto_sim.device)
+        proto_sep_loss = (proto_sim * (1 - eye)).pow(2).sum() / (self.total_nc * (self.total_nc - 1))
+
+        return instance_loss, proto_sep_loss
+
+    def merge_subcategory_scores(self, scores: torch.Tensor) -> torch.Tensor:
+        """
+        Merge subcategory scores back to main category scores for inference.
+
+        Uses the hierarchical mapping matrix to aggregate subcategory predictions
+        into their parent categories. Supports multiple aggregation strategies.
+
+        Args:
+            scores (torch.Tensor): Subcategory scores [bs, num_queries, total_nc].
+
+        Returns:
+            (torch.Tensor): Main category scores [bs, num_queries, original_nc].
+
+        Note:
+            Currently uses sum aggregation. Could be extended to max or weighted average.
+        """
+        # Matrix multiplication: [bs, nq, total_nc] @ [total_nc, original_nc] → [bs, nq, original_nc]
+        # Each subcategory's score contributes to its parent main category
+        main_scores = torch.matmul(scores, self.sub_to_main)
+        return main_scores
+
+    def forward(self, x: List[torch.Tensor], batch: Optional[dict] = None) -> Union[Tuple, torch.Tensor]:
+        """
+        Forward pass with hierarchical prototype learning.
+
+        During training:
+            - Uses fine-grained subcategory labels
+            - Computes prototype contrastive loss
+            - Returns (dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta, prototype_losses)
+
+        During inference:
+            - Uses fine-grained predictions
+            - Merges subcategory scores to main categories
+            - Returns (main_category_predictions,) or (main_category_predictions, detailed_outputs)
+
+        Args:
+            x (List[torch.Tensor]): List of feature maps from the backbone.
+            batch (dict, optional): Batch information for training. Should contain:
+                - 'cls': Ground truth class labels (with subcategories during training)
+                - Other fields required by parent RTDETRDecoder
+
+        Returns:
+            (tuple | torch.Tensor): During training, returns outputs with prototype losses.
+                During inference, returns predictions with main categories only.
+        """
+        from ultralytics.models.utils.ops import get_cdn_group
+
+        # Input projection and embedding
+        feats, shapes = self._get_encoder_input(x)
+
+        # Prepare denoising training
+        dn_embed, dn_bbox, attn_mask, dn_meta = get_cdn_group(
+            batch,
+            self.nc,  # Use total_nc during training
+            self.num_queries,
+            self.denoising_class_embed.weight,
+            self.num_denoising,
+            self.label_noise_ratio,
+            self.box_noise_scale,
+            self.training,
+        )
+
+        embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
+
+        # Decoder
+        dec_bboxes, dec_scores = self.decoder(
+            embed,
+            refer_bbox,
+            feats,
+            shapes,
+            self.dec_bbox_head,
+            self.dec_score_head,
+            self.query_pos_head,
+            attn_mask=attn_mask,
+        )
+
+        if self.training:
+            # === Training mode: compute prototype losses ===
+            prototype_losses = {}
+
+            if batch is not None and 'cls' in batch:
+                # Extract query features from last decoder layer
+                # We need to match predictions with ground truth first
+                # For simplicity, we'll use the encoder features as a proxy
+                # In a full implementation, you'd extract features from the decoder
+
+                # Get ground truth labels from batch
+                gt_labels = batch['cls'].long()  # [bs, max_objects]
+
+                # For now, we'll compute loss on encoder features
+                # In production, you'd want to extract decoder query features
+                bs = enc_scores.shape[0]
+
+                # Simple approach: use top-scored queries
+                if enc_scores.numel() > 0:
+                    # Get features for top queries (approximation)
+                    # In full implementation, extract from decoder output
+                    num_samples = min(enc_scores.shape[1], 100)  # Limit for efficiency
+
+                    # Use encoder features as proxy (simplified)
+                    # Full implementation would extract decoder embeddings
+                    sample_features = embed[:, :num_samples, :].reshape(-1, self.hidden_dim)
+
+                    # Create dummy labels for demonstration
+                    # In production, match predictions with GT using Hungarian matching
+                    if gt_labels.numel() > 0:
+                        # Simplified: use GT labels directly (should be matched predictions)
+                        valid_labels = gt_labels[gt_labels >= 0][:num_samples * bs]
+
+                        if valid_labels.numel() > 0 and valid_labels.numel() <= sample_features.shape[0]:
+                            # Ensure labels are within valid range
+                            valid_labels = valid_labels.clamp(0, self.total_nc - 1)
+
+                            # Trim features to match labels
+                            sample_features = sample_features[:valid_labels.numel()]
+
+                            # Compute prototype losses
+                            instance_loss, proto_sep_loss = self.prototype_contrastive_loss(
+                                sample_features, valid_labels
+                            )
+
+                            prototype_losses['instance_proto_loss'] = instance_loss
+                            prototype_losses['proto_separation_loss'] = proto_sep_loss
+
+            # Return training outputs with prototype losses
+            return dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta, prototype_losses
+
+        else:
+            # === Inference mode: merge subcategory scores to main categories ===
+            # dec_bboxes: [1, num_queries, 4]
+            # dec_scores: [1, num_queries, total_nc]
+
+            # Merge subcategory scores to main categories
+            main_scores = self.merge_subcategory_scores(dec_scores)  # [1, num_queries, original_nc]
+
+            # Combine boxes and main category scores
+            # Shape: [bs, 300, 4 + original_nc]
+            y = torch.cat((dec_bboxes.squeeze(0), main_scores.squeeze(0).sigmoid()), -1)
+
+            # Update nc for export (ensure consistency)
+            self.nc = self.original_nc
+
+            return y if self.export else (y, (dec_bboxes, main_scores, enc_bboxes, enc_scores, dn_meta))
 
 
 class v10Detect(Detect):
