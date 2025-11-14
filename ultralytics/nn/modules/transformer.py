@@ -23,6 +23,7 @@ __all__ = (
     "DeformableTransformerDecoderLayer",
     "MSDeformAttn",
     "MLP",
+    "ASDA",
 )
 
 
@@ -800,3 +801,194 @@ class DeformableTransformerDecoder(nn.Module):
             refer_bbox = refined_bbox.detach() if self.training else refined_bbox
 
         return torch.stack(dec_bboxes), torch.stack(dec_cls)
+
+
+class ASDA(MSDeformAttn):
+    """
+    Aspect-ratio Sensitive Deformable Attention for elongated object detection.
+
+    This class extends MSDeformAttn to adaptively adjust sampling patterns based on object aspect ratios,
+    making it particularly suitable for detecting elongated objects like cucumbers in agricultural scenes.
+
+    Key innovations:
+        1. Aspect-ratio prediction network: Predicts the aspect ratio of each query
+        2. Elliptical sampling pattern: Adapts sampling points based on aspect ratio
+        3. Adaptive offset scaling: Scales offsets differently along major and minor axes
+
+    Attributes:
+        aspect_ratio_predictor (nn.Sequential): MLP for predicting aspect ratios
+        ellipse_bias (nn.Parameter): Learnable elliptical sampling bias
+        aspect_ratio_range (tuple): Min and max aspect ratios (default: 1.0 to 10.0)
+
+    Examples:
+        >>> asda = ASDA(d_model=256, n_levels=4, n_heads=8, n_points=4)
+        >>> query = torch.randn(2, 300, 256)
+        >>> refer_bbox = torch.randn(2, 300, 4, 4)
+        >>> value = torch.randn(2, 1000, 256)
+        >>> value_shapes = [(20, 20), (10, 10), (5, 5), (3, 3)]
+        >>> output = asda(query, refer_bbox, value, value_shapes)
+
+    References:
+        - Deformable DETR (ICLR 2021): https://arxiv.org/abs/2010.04159
+        - D-LKA (Bearing-DETR, 2024): Large Kernel Deformable Attention
+        - DAT (NeurIPS 2022): https://arxiv.org/abs/2201.00520
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        n_levels: int = 4,
+        n_heads: int = 8,
+        n_points: int = 4,
+        aspect_ratio_range: tuple = (1.0, 10.0),
+    ):
+        """
+        Initialize ASDA with aspect-ratio sensitive sampling.
+
+        Args:
+            d_model (int): Model dimension.
+            n_levels (int): Number of feature levels.
+            n_heads (int): Number of attention heads.
+            n_points (int): Number of sampling points per head per level.
+            aspect_ratio_range (tuple): (min_ratio, max_ratio) for aspect ratio prediction.
+                Default (1.0, 10.0) means square to 10:1 elongated objects.
+        """
+        super().__init__(d_model, n_levels, n_heads, n_points)
+
+        self.aspect_ratio_range = aspect_ratio_range
+
+        # Aspect ratio prediction network (Innovation 1)
+        # Input: query feature (d_model) -> Output: aspect ratio scalar
+        self.aspect_ratio_predictor = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 4, 1),
+            nn.Sigmoid(),  # Output [0, 1], will be mapped to aspect_ratio_range
+        )
+
+        # Elliptical sampling bias (Innovation 2)
+        # Shape: [n_heads, n_levels, n_points, 2]
+        # This adds a learnable elliptical pattern to sampling offsets
+        self.ellipse_bias = nn.Parameter(torch.zeros(n_heads, n_levels, n_points, 2))
+
+        # Re-initialize with elliptical pattern
+        self._reset_aspect_parameters()
+
+    def _reset_aspect_parameters(self):
+        """Initialize elliptical sampling pattern for elongated objects."""
+        # Standard MSDeformAttn initialization is already done in super().__init__()
+        # Now we initialize the elliptical bias
+
+        with torch.no_grad():
+            for i in range(self.n_points):
+                # Distribute points in elliptical pattern
+                angle = 2 * math.pi * i / self.n_points
+
+                # Major axis (horizontal) - 2x larger for elongated objects
+                # Minor axis (vertical) - 0.5x smaller
+                self.ellipse_bias[:, :, i, 0] = math.cos(angle) * 2.0  # x-direction
+                self.ellipse_bias[:, :, i, 1] = math.sin(angle) * 0.5  # y-direction
+
+        # Initialize aspect ratio predictor
+        for m in self.aspect_ratio_predictor.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        refer_bbox: torch.Tensor,
+        value: torch.Tensor,
+        value_shapes: List,
+        value_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with aspect-ratio sensitive deformable attention.
+
+        Args:
+            query (torch.Tensor): [bs, query_length, C] Query features
+            refer_bbox (torch.Tensor): [bs, query_length, n_levels, 2 or 4] Reference boxes
+                If last dim = 2: center points (cx, cy)
+                If last dim = 4: boxes (cx, cy, w, h)
+            value (torch.Tensor): [bs, value_length, C] Value features
+            value_shapes (List[tuple]): [(H_0, W_0), (H_1, W_1), ...] Feature map shapes
+            value_mask (torch.Tensor, optional): [bs, value_length] Padding mask
+
+        Returns:
+            (torch.Tensor): [bs, query_length, C] Output features after attention
+
+        Note:
+            The aspect ratio is predicted per query and used to adaptively scale
+            sampling offsets, creating an elliptical sampling pattern for elongated objects.
+        """
+        bs, len_q = query.shape[:2]
+        len_v = value.shape[1]
+        assert sum(s[0] * s[1] for s in value_shapes) == len_v
+
+        # === Innovation 3: Predict aspect ratio for each query ===
+        aspect_ratios = self.aspect_ratio_predictor(query)  # [bs, len_q, 1]
+
+        # Map from [0, 1] to [min_ratio, max_ratio]
+        min_ratio, max_ratio = self.aspect_ratio_range
+        aspect_ratios = aspect_ratios * (max_ratio - min_ratio) + min_ratio  # [bs, len_q, 1]
+
+        # === Standard deformable attention computation ===
+        value = self.value_proj(value)
+        if value_mask is not None:
+            value = value.masked_fill(value_mask[..., None], float(0))
+        value = value.view(bs, len_v, self.n_heads, self.d_model // self.n_heads)
+
+        # Compute base sampling offsets
+        sampling_offsets = self.sampling_offsets(query).view(
+            bs, len_q, self.n_heads, self.n_levels, self.n_points, 2
+        )
+
+        # === Innovation 4: Apply aspect-ratio adaptive scaling ===
+        # Create scaling factors: [aspect_ratio, 1/aspect_ratio] for [x, y]
+        aspect_scale = torch.stack(
+            [
+                aspect_ratios.squeeze(-1),  # x-direction: scale by aspect_ratio
+                1.0 / (aspect_ratios.squeeze(-1) + 1e-6),  # y-direction: scale by 1/aspect_ratio
+            ],
+            dim=-1,
+        )  # [bs, len_q, 2]
+
+        # Expand dimensions for broadcasting: [bs, len_q, 1, 1, 1, 2]
+        aspect_scale = aspect_scale[:, :, None, None, None, :]
+
+        # Apply adaptive scaling to offsets
+        sampling_offsets = sampling_offsets * aspect_scale
+
+        # === Innovation 2: Add elliptical bias ===
+        # Expand ellipse_bias: [n_heads, n_levels, n_points, 2] -> [1, 1, n_heads, n_levels, n_points, 2]
+        ellipse_bias_expanded = self.ellipse_bias.unsqueeze(0).unsqueeze(0)
+        sampling_offsets = sampling_offsets + ellipse_bias_expanded
+
+        # Compute attention weights
+        attention_weights = self.attention_weights(query).view(bs, len_q, self.n_heads, self.n_levels * self.n_points)
+        attention_weights = F.softmax(attention_weights, -1).view(
+            bs, len_q, self.n_heads, self.n_levels, self.n_points
+        )
+
+        # === Compute sampling locations ===
+        num_points = refer_bbox.shape[-1]
+        if num_points == 2:
+            # Reference points are centers (cx, cy)
+            offset_normalizer = torch.as_tensor(value_shapes, dtype=query.dtype, device=query.device).flip(-1)
+            add = sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+            sampling_locations = refer_bbox[:, :, None, :, None, :] + add
+        elif num_points == 4:
+            # Reference points are boxes (cx, cy, w, h)
+            # Use box width and height to scale offsets
+            add = sampling_offsets / self.n_points * refer_bbox[:, :, None, :, None, 2:] * 0.5
+            sampling_locations = refer_bbox[:, :, None, :, None, :2] + add
+        else:
+            raise ValueError(f"Last dim of refer_bbox must be 2 or 4, but got {num_points}.")
+
+        # === Apply multi-scale deformable attention ===
+        output = multi_scale_deformable_attn_pytorch(value, value_shapes, sampling_locations, attention_weights)
+
+        return self.output_proj(output)
