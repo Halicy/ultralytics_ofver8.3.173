@@ -761,6 +761,7 @@ class DeformableTransformerDecoder(nn.Module):
         pos_mlp: nn.Module,
         attn_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        return_query_embed: bool = False,  # ✅ NEW: For HCP-DETR prototype learning
     ):
         """
         Perform the forward pass through the entire decoder.
@@ -775,10 +776,17 @@ class DeformableTransformerDecoder(nn.Module):
             pos_mlp (nn.Module): Position MLP.
             attn_mask (torch.Tensor, optional): Attention mask.
             padding_mask (torch.Tensor, optional): Padding mask.
+            return_query_embed (bool): If True, also return final query embeddings.
+                Required for HCP-DETR prototype learning. Default: False (backward compatible).
 
         Returns:
-            dec_bboxes (torch.Tensor): Decoded bounding boxes.
-            dec_cls (torch.Tensor): Decoded classification scores.
+            If return_query_embed is False (default):
+                dec_bboxes (torch.Tensor): Decoded bounding boxes.
+                dec_cls (torch.Tensor): Decoded classification scores.
+            If return_query_embed is True:
+                dec_bboxes (torch.Tensor): Decoded bounding boxes.
+                dec_cls (torch.Tensor): Decoded classification scores.
+                query_embed (torch.Tensor): Final query embeddings from last decoder layer.
         """
         output = embed
         dec_bboxes = []
@@ -805,7 +813,15 @@ class DeformableTransformerDecoder(nn.Module):
             last_refined_bbox = refined_bbox
             refer_bbox = refined_bbox.detach() if self.training else refined_bbox
 
-        return torch.stack(dec_bboxes), torch.stack(dec_cls)
+        # ✅ FIX Bug #1: Return query embeddings if requested (for HCP-DETR)
+        # 'output' now contains the final query embeddings from the last decoder layer
+        # Shape: [bs, num_queries, hidden_dim]
+        # This is the CORRECT feature space for prototype learning (not encoder features!)
+        if return_query_embed:
+            return torch.stack(dec_bboxes), torch.stack(dec_cls), output
+        else:
+            # Backward compatible: only return boxes and scores
+            return torch.stack(dec_bboxes), torch.stack(dec_cls)
 
 
 class ASDA(MSDeformAttn):

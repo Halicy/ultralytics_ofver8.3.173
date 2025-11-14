@@ -1465,8 +1465,9 @@ class HCPRTDETRDecoder(RTDETRDecoder):
 
         embed, refer_bbox, enc_bboxes, enc_scores = self._get_decoder_input(feats, shapes, dn_embed, dn_bbox)
 
-        # Decoder
-        dec_bboxes, dec_scores = self.decoder(
+        # ✅ FIX Bug #1: Request query embeddings from decoder for prototype learning
+        # Decoder with query embedding return (for HCP-DETR prototype learning)
+        dec_bboxes, dec_scores, query_embed = self.decoder(
             embed,
             refer_bbox,
             feats,
@@ -1475,55 +1476,60 @@ class HCPRTDETRDecoder(RTDETRDecoder):
             self.dec_score_head,
             self.query_pos_head,
             attn_mask=attn_mask,
+            return_query_embed=True,  # ✅ Request query embeddings for prototype learning
         )
 
         if self.training:
             # === Training mode: compute prototype losses ===
+            # ✅ FIX: Use Hungarian matching + subcategory mapping for correct prototype learning
             prototype_losses = {}
 
-            if batch is not None and 'cls' in batch:
-                # Extract query features from last decoder layer
-                # We need to match predictions with ground truth first
-                # For simplicity, we'll use the encoder features as a proxy
-                # In a full implementation, you'd extract features from the decoder
+            if batch is not None and 'cls' in batch and 'bboxes' in batch:
+                from ultralytics.utils.hcp_utils import (
+                    hungarian_match_hcp_detr,
+                    map_to_subcategories_hcp_detr,
+                )
 
-                # Get ground truth labels from batch
+                # Get ground truth from batch
                 gt_labels = batch['cls'].long()  # [bs, max_objects]
+                gt_boxes = batch['bboxes']  # [bs, max_objects, 4]
 
-                # For now, we'll compute loss on encoder features
-                # In production, you'd want to extract decoder query features
-                bs = enc_scores.shape[0]
+                # ✅ FIX Bug #1: Use decoder query embeddings (correct feature space)
+                # Previously used `embed` (encoder features) - WRONG!
+                # Now use `query_embed` (decoder query features) - CORRECT!
 
-                # Simple approach: use top-scored queries
-                if enc_scores.numel() > 0:
-                    # Get features for top queries (approximation)
-                    # In full implementation, extract from decoder output
-                    num_samples = min(enc_scores.shape[1], 100)  # Limit for efficiency
+                # ✅ FIX Bug #2: Hungarian matching for correct alignment
+                # Match predictions with ground truth to ensure features and labels align
+                matched_features, matched_labels = hungarian_match_hcp_detr(
+                    pred_boxes=dec_bboxes[-1],  # Use last decoder layer predictions [bs, nq, 4]
+                    pred_scores=dec_scores[-1],  # [bs, nq, total_nc]
+                    gt_boxes=gt_boxes,  # [bs, max_gt, 4]
+                    gt_labels=gt_labels,  # [bs, max_gt]
+                    query_embed=query_embed,  # ✅ Decoder query features [bs, nq, hidden_dim]
+                )
 
-                    # Use encoder features as proxy (simplified)
-                    # Full implementation would extract decoder embeddings
-                    sample_features = embed[:, :num_samples, :].reshape(-1, self.hidden_dim)
+                if matched_features is not None and matched_labels is not None:
+                    # ✅ FIX Bug #3: Map to subcategories to train ALL prototypes
+                    # Without this, 67% of prototypes (young_fruit, flower, occluded, malformed)
+                    # remain untrained (Xavier initialized)!
+                    if hasattr(self, 'sub_categories') and self.sub_categories:
+                        matched_labels = map_to_subcategories_hcp_detr(
+                            labels=matched_labels,
+                            sub_categories=self.sub_categories,
+                            strategy='uniform',  # Evenly distribute across subcategories
+                        )
 
-                    # Create dummy labels for demonstration
-                    # In production, match predictions with GT using Hungarian matching
-                    if gt_labels.numel() > 0:
-                        # Simplified: use GT labels directly (should be matched predictions)
-                        valid_labels = gt_labels[gt_labels >= 0][:num_samples * bs]
+                    # Ensure labels are within valid range [0, total_nc)
+                    matched_labels = matched_labels.clamp(0, self.total_nc - 1)
 
-                        if valid_labels.numel() > 0 and valid_labels.numel() <= sample_features.shape[0]:
-                            # Ensure labels are within valid range
-                            valid_labels = valid_labels.clamp(0, self.total_nc - 1)
+                    # ✅ CORRECT: Compute prototype losses with properly matched features and labels
+                    instance_loss, proto_sep_loss = self.prototype_contrastive_loss(
+                        matched_features,  # ✅ From decoder query space
+                        matched_labels,  # ✅ Hungarian matched + subcategory mapped
+                    )
 
-                            # Trim features to match labels
-                            sample_features = sample_features[:valid_labels.numel()]
-
-                            # Compute prototype losses
-                            instance_loss, proto_sep_loss = self.prototype_contrastive_loss(
-                                sample_features, valid_labels
-                            )
-
-                            prototype_losses['instance_proto_loss'] = instance_loss
-                            prototype_losses['proto_separation_loss'] = proto_sep_loss
+                    prototype_losses['instance_proto_loss'] = instance_loss
+                    prototype_losses['proto_separation_loss'] = proto_sep_loss
 
             # Return training outputs with prototype losses
             return dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta, prototype_losses
