@@ -101,6 +101,13 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .vmamba import (
+    VisionMambaBackbone,
+    VMambaStage,
+    vmamba_tiny,
+    vmamba_small,
+    vmamba_base,
+)
 
 __all__ = (
     "Conv",
@@ -179,4 +186,9 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "VisionMambaBackbone",
+    "VMambaStage",
+    "vmamba_tiny",
+    "vmamba_small",
+    "vmamba_base",
 )

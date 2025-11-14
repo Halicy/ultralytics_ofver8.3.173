@@ -1,0 +1,77 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# RT-DETR with Vision Mamba (VMamba) Backbone - Tiny Version
+# This configuration replaces the traditional CNN backbone with Vision Mamba,
+# a state-space model that offers linear complexity and global receptive fields.
+# Particularly effective for "green-on-green" detection and complex backgrounds.
+
+# Model docs: https://docs.ultralytics.com/models/rtdetr
+# VMamba paper: https://arxiv.org/abs/2401.09417
+# VMamba code: https://github.com/MzeroMiko/VMamba
+
+# Parameters
+nc: 80  # number of classes
+scales:  # model compound scaling constants
+  # [depth, width, max_channels]
+  tiny: [1.00, 1.00, 768]
+
+backbone:
+  # Vision Mamba Backbone Architecture
+  # VMamba uses patch embedding + hierarchical stages with state-space models
+  # Output channels: [96, 192, 384, 768] for tiny version
+  # Spatial scales: P2/4, P3/8, P4/16, P5/32
+
+  # [from, repeats, module, args]
+
+  # Patch Embedding - converts input to patches (224x224 -> 56x56)
+  - [-1, 1, Conv, [96, 4, 4]]  # 0-P2/4, stride=4 patch embedding
+
+  # Stage 1: VMamba blocks at P2/4 resolution (56x56)
+  - [-1, 2, VMambaStage, [96]]  # 1-Stage1, 2 VMamba blocks, 96 channels
+
+  # Downsample to P3/8 (28x28)
+  - [-1, 1, Conv, [192, 3, 2, 1]]  # 2-Downsample to P3/8
+
+  # Stage 2: VMamba blocks at P3/8 resolution (28x28)
+  - [-1, 2, VMambaStage, [192]]  # 3-Stage2, 2 VMamba blocks, 192 channels
+
+  # Downsample to P4/16 (14x14)
+  - [-1, 1, Conv, [384, 3, 2, 1]]  # 4-Downsample to P4/16
+
+  # Stage 3: VMamba blocks at P4/16 resolution (14x14) - 5 blocks for deeper features
+  - [-1, 5, VMambaStage, [384]]  # 5-Stage3, 5 VMamba blocks, 384 channels
+
+  # Downsample to P5/32 (7x7)
+  - [-1, 1, Conv, [768, 3, 2, 1]]  # 6-Downsample to P5/32
+
+  # Stage 4: VMamba blocks at P5/32 resolution (7x7)
+  - [-1, 2, VMambaStage, [768]]  # 7-Stage4, 2 VMamba blocks, 768 channels
+
+head:
+  # RT-DETR Head with AIFI (Attention-based Intrascale Feature Interaction)
+  # Takes features from Stage 3 (P4/16), Stage 4 (P5/32), and creates P3/8
+
+  - [-1, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 8 input_proj.2
+  - [-1, 1, AIFI, [1024, 8]]  # 9 AIFI with 8 heads
+  - [-1, 1, Conv, [256, 1, 1]]  # 10, Y5, lateral_convs.0
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [5, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 12 input_proj.1 from Stage3
+  - [[-2, -1], 1, Concat, [1]]
+  - [-1, 3, RepC3, [256]]  # 14, fpn_blocks.0
+  - [-1, 1, Conv, [256, 1, 1]]  # 15, Y4, lateral_convs.1
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [3, 1, Conv, [256, 1, 1, None, 1, 1, False]]  # 17 input_proj.0 from Stage2
+  - [[-2, -1], 1, Concat, [1]]  # cat backbone P3
+  - [-1, 3, RepC3, [256]]  # 19 X3, fpn_blocks.1
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 20, downsample_convs.0
+  - [[-1, 15], 1, Concat, [1]]  # cat Y4
+  - [-1, 3, RepC3, [256]]  # 22 F4, pan_blocks.0
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 23, downsample_convs.1
+  - [[-1, 10], 1, Concat, [1]]  # cat Y5
+  - [-1, 3, RepC3, [256]]  # 25 F5, pan_blocks.1
+
+  - [[19, 22, 25], 1, RTDETRDecoder, [nc]]  # Detect(P3, P4, P5)
