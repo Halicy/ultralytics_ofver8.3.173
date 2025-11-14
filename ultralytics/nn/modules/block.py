@@ -2203,43 +2203,48 @@ class AnisotropicPConv(nn.Module):
 
 class RepAPConvBlock(nn.Module):
     """
-    Re-parameterizable Anisotropic Partial Convolution Block.
+    Re-parameterizable Anisotropic Convolution Block (FIXED VERSION).
 
     Core innovation combining:
         1. RepVGG-style re-parameterization (CVPR 2021)
-        2. Anisotropic Partial Convolution (our innovation)
+        2. Anisotropic convolution for elongated objects
         3. Multi-branch training → single-branch inference
 
-    Training mode branches:
+    Training mode branches (ALL process full c1 channels):
         - 3x3 standard conv
-        - 1x3 horizontal conv (anisotropic)
-        - 3x1 vertical conv (anisotropic)
-        - 1x1 point-wise conv
+        - 1x3 horizontal conv (anisotropic - captures horizontal features)
+        - 3x1 vertical conv (anisotropic - captures vertical features)
+        - 1x1 point-wise conv (efficient channel mixing)
         - Identity (if c1 == c2 and s == 1)
 
     Inference mode:
         - Fused into single 3x3 conv (via re-parameterization)
-        - No performance overhead
+        - Zero performance overhead, same as single conv
 
     Args:
         c1 (int): Input channels.
         c2 (int): Output channels.
         k (int): Kernel size for main branch. Default: 3.
         s (int): Stride. Default: 1.
-        ratio (float): Channel ratio for partial convolution. Default: 0.5.
+        ratio (float): DEPRECATED (kept for API compatibility). All branches use full channels.
         act (bool | nn.Module): Activation function. Default: True.
         deploy (bool): Whether in deployment mode (fused). Default: False.
 
     Benefits:
-        - Training: Multiple branches learn diverse features
-        - Inference: Single branch for speed (no overhead)
-        - Anisotropic branches: Better for elongated objects
-        - Partial convolution: Efficient computation
+        - Training: Multiple branches learn diverse directional features
+        - Inference: Single fused conv (no overhead)
+        - Anisotropic branches: Excellent for elongated objects (cucumbers!)
+        - Re-parameterizable: Can be deployed efficiently
+
+    FIXED: All branches now process full c1 channels (not partial).
+           This allows correct re-parameterization without shape mismatch.
+           Previous version had critical bug where different branches had
+           incompatible kernel shapes, preventing fusion.
     """
 
     def __init__(self, c1: int, c2: int, k: int = 3, s: int = 1,
                  ratio: float = 0.5, act: bool = True, deploy: bool = False):
-        """Initialize RepAPConvBlock with multi-branch structure."""
+        """Initialize RepAPConvBlock with multi-branch structure (all branches use full c1)."""
         super().__init__()
 
         self.c1 = c1
@@ -2253,44 +2258,37 @@ class RepAPConvBlock(nn.Module):
             self.rep_conv = nn.Conv2d(c1, c2, k, s, padding=k // 2, bias=True)
         else:
             # Training mode: multiple branches
+            # ✅ FIX: ALL branches now use c1 (not cp or cr)
+            # This ensures all kernels have shape [c2, c1, ...] and can be fused
 
-            # Calculate partial channels
-            cp = int(c1 * ratio)
-
-            # Branch 1: 3x3 standard conv (on partial channels)
+            # Branch 1: 3x3 standard conv (full channels)
             self.conv_3x3 = nn.Sequential(
-                nn.Conv2d(cp, c2, 3, s, padding=1, bias=False),
+                nn.Conv2d(c1, c2, 3, s, padding=1, bias=False),
                 nn.BatchNorm2d(c2)
             )
 
-            # Branch 2: 1x3 horizontal conv (anisotropic)
+            # Branch 2: 1x3 horizontal conv (anisotropic - for horizontal features)
             self.conv_1x3 = nn.Sequential(
-                nn.Conv2d(cp, c2, (1, 3), s, padding=(0, 1), bias=False),
+                nn.Conv2d(c1, c2, (1, 3), s, padding=(0, 1), bias=False),
                 nn.BatchNorm2d(c2)
             )
 
-            # Branch 3: 3x1 vertical conv (anisotropic)
+            # Branch 3: 3x1 vertical conv (anisotropic - for vertical features)
             self.conv_3x1 = nn.Sequential(
-                nn.Conv2d(cp, c2, (3, 1), s, padding=(1, 0), bias=False),
+                nn.Conv2d(c1, c2, (3, 1), s, padding=(1, 0), bias=False),
                 nn.BatchNorm2d(c2)
             )
 
-            # Branch 4: 1x1 point-wise conv (on remaining channels)
-            cr = c1 - cp
-            self.conv_1x1 = None
-            if cr > 0:
-                self.conv_1x1 = nn.Sequential(
-                    nn.Conv2d(cr, c2, 1, s, padding=0, bias=False),
-                    nn.BatchNorm2d(c2)
-                )
+            # Branch 4: 1x1 point-wise conv (full channels, efficient mixing)
+            self.conv_1x1 = nn.Sequential(
+                nn.Conv2d(c1, c2, 1, s, padding=0, bias=False),
+                nn.BatchNorm2d(c2)
+            )
 
             # Branch 5: Identity (if applicable)
             self.identity = None
             if c1 == c2 and s == 1:
                 self.identity = nn.BatchNorm2d(c1)
-
-            self.cp = cp
-            self.cr = cr
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with multi-branch or fused conv."""
@@ -2299,17 +2297,13 @@ class RepAPConvBlock(nn.Module):
             return self.act_layer(self.rep_conv(x))
 
         # Training: multi-branch
-        # Split input
-        x_partial = x[:, :self.cp, :, :]
-        x_remain = x[:, self.cp:, :, :] if self.cr > 0 else None
+        # ✅ FIX: All branches process SAME input (full x)
+        # No more channel splitting - ensures compatible kernel shapes
 
-        # Branch outputs
-        out = self.conv_3x3(x_partial)         # 3x3 conv
-        out = out + self.conv_1x3(x_partial)   # + 1x3 conv
-        out = out + self.conv_3x1(x_partial)   # + 3x1 conv
-
-        if self.conv_1x1 is not None and x_remain is not None:
-            out = out + self.conv_1x1(x_remain)  # + 1x1 conv
+        out = self.conv_3x3(x)      # 3x3 conv on full input
+        out = out + self.conv_1x3(x)   # + 1x3 conv on full input (horizontal features)
+        out = out + self.conv_3x1(x)   # + 3x1 conv on full input (vertical features)
+        out = out + self.conv_1x1(x)   # + 1x1 conv on full input (channel mixing)
 
         if self.identity is not None:
             out = out + self.identity(x)  # + identity
@@ -2321,36 +2315,35 @@ class RepAPConvBlock(nn.Module):
         Fuse all branches into a single 3x3 conv for inference.
 
         Re-parameterization process:
-            1. Extract weights and biases from all branches
-            2. Pad smaller kernels to 3x3 size
-            3. Sum all kernel weights
-            4. Fuse batch normalization into conv
-            5. Create single conv with fused weights
+            1. Fuse each (conv + batchnorm) into single conv with bias
+            2. Pad smaller kernels (1x3, 3x1, 1x1) to 3x3 size
+            3. Sum all kernel weights and biases
+            4. Create single fused conv
 
-        This maintains exact same output while using single conv for speed.
+        This maintains EXACT same output while using single conv for speed.
+
+        ✅ FIXED: Now all kernels have shape [c2, c1, ...], can be summed correctly.
+                  Previous version had shape mismatch bug.
         """
         if self.deploy:
             return
 
-        # Get fused kernel and bias from all branches
-        kernel_3x3, bias_3x3 = self._fuse_bn_tensor(self.conv_3x3[0], self.conv_3x3[1])
-        kernel_1x3, bias_1x3 = self._fuse_bn_tensor(self.conv_1x3[0], self.conv_1x3[1])
-        kernel_3x1, bias_3x1 = self._fuse_bn_tensor(self.conv_3x1[0], self.conv_3x1[1])
+        # ✅ Step 1: Fuse each branch (conv + bn) into kernel and bias
+        # All kernels now have compatible shape [c2, c1, h, w]
+        kernel_3x3, bias_3x3 = self._fuse_bn_tensor(self.conv_3x3[0], self.conv_3x3[1])  # [c2, c1, 3, 3]
+        kernel_1x3, bias_1x3 = self._fuse_bn_tensor(self.conv_1x3[0], self.conv_1x3[1])  # [c2, c1, 1, 3]
+        kernel_3x1, bias_3x1 = self._fuse_bn_tensor(self.conv_3x1[0], self.conv_3x1[1])  # [c2, c1, 3, 1]
+        kernel_1x1, bias_1x1 = self._fuse_bn_tensor(self.conv_1x1[0], self.conv_1x1[1])  # [c2, c1, 1, 1]
 
-        # Pad 1x3 and 3x1 kernels to 3x3
-        kernel_1x3 = self._pad_kernel_1x3_to_3x3(kernel_1x3)
-        kernel_3x1 = self._pad_kernel_3x1_to_3x3(kernel_3x1)
+        # ✅ Step 2: Pad all kernels to 3x3 size
+        kernel_1x3 = self._pad_kernel_1x3_to_3x3(kernel_1x3)  # [c2, c1, 1, 3] → [c2, c1, 3, 3]
+        kernel_3x1 = self._pad_kernel_3x1_to_3x3(kernel_3x1)  # [c2, c1, 3, 1] → [c2, c1, 3, 3]
+        kernel_1x1 = self._pad_kernel_1x1_to_3x3(kernel_1x1)  # [c2, c1, 1, 1] → [c2, c1, 3, 3]
 
-        # Sum all kernels
-        kernel = kernel_3x3 + kernel_1x3 + kernel_3x1
-        bias = bias_3x3 + bias_1x3 + bias_3x1
-
-        # Add 1x1 conv if exists
-        if self.conv_1x1 is not None:
-            kernel_1x1, bias_1x1 = self._fuse_bn_tensor(self.conv_1x1[0], self.conv_1x1[1])
-            kernel_1x1 = self._pad_kernel_1x1_to_3x3(kernel_1x1)
-            kernel += kernel_1x1
-            bias += bias_1x1
+        # ✅ Step 3: Sum all kernels and biases
+        # Now all have same shape [c2, c1, 3, 3] - can be added!
+        kernel = kernel_3x3 + kernel_1x3 + kernel_3x1 + kernel_1x1
+        bias = bias_3x3 + bias_1x3 + bias_3x1 + bias_1x1
 
         # Add identity if exists
         if self.identity is not None:
