@@ -1399,9 +1399,13 @@ class HCPRTDETRDecoder(RTDETRDecoder):
             prototype_loss = self._compute_prototype_loss(embed, batch)
 
         # Add prototype_loss to dn_meta to maintain compatibility with RTDETRDetectionModel.loss()
-        if dn_meta is None:
-            dn_meta = {}
-        dn_meta["prototype_loss"] = prototype_loss
+        # CRITICAL: Only add to dn_meta if it already exists (training mode with denoising)
+        # If dn_meta is None (inference mode), keep it as None to maintain compatibility
+        if dn_meta is not None:
+            dn_meta["prototype_loss"] = prototype_loss
+        else:
+            # Store prototype_loss as instance attribute for access during inference if needed
+            self._last_prototype_loss = prototype_loss
 
         x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
