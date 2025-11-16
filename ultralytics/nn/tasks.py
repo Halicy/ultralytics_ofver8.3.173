@@ -51,10 +51,12 @@ from ultralytics.nn.modules import (
     GhostConv,
     HGBlock,
     HGStem,
+    HCPRTDETRDecoder,
     ImagePoolingAttn,
     Index,
     LRPCHead,
     Pose,
+    RepAPConvBlock,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -1722,7 +1724,7 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
                 m.legacy = legacy
-        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+        elif m in {RTDETRDecoder, HCPRTDETRDecoder}:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         elif m is CBLinear:
             c2 = args[0]
