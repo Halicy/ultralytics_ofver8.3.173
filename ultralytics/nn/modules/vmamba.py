@@ -1,3 +1,4 @@
+# python
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
 Vision Mamba (VMamba) backbone implementation for Ultralytics.
@@ -19,6 +20,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 from typing import Optional, Callable, List, Tuple
+
+# Note: do NOT import VMambaStage from this same module here to avoid circular imports.
+# VMambaStage is defined at the bottom of this file.
 
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
@@ -141,11 +145,11 @@ class SS2D(nn.Module):
         # SSM parameters - we'll use 4 directions for cross-scan
         self.K = 4  # Number of scanning directions
 
-        # x_proj: projects hidden states to dt, B, C
-        self.x_proj = nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2) * self.K, bias=False)
+        # x_proj: projects hidden states to dt, B, C (per direction)
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
 
-        # dt_proj: projects dt_rank to d_inner
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner * self.K, bias=True)
+        # dt_proj: projects dt_rank to d_inner (per direction)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
 
         # A and D parameters for SSM
         A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner * self.K, 1)
@@ -176,30 +180,32 @@ class SS2D(nn.Module):
             torch.flip(x_flat.view(B, H, W, C).transpose(1, 2).reshape(B, L, C), dims=[1]),  # column-wise reverse
         ], dim=1)  # (B, K, L, C)
 
-        # Project to get dt, B, C
-        x_dbl = self.x_proj(xs.view(-1, C))  # (B*K*L, dt_rank + d_state*2)
+        # Project to get dt, B, C for each direction
+        x_dbl = self.x_proj(xs.reshape(B * K * L, C))  # (B*K*L, dt_rank + d_state*2)
+
         dt, B_ssm, C_ssm = torch.split(
             x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1
         )
 
         # Project dt
-        dt = self.dt_proj(dt)  # (B*K*L, C*K)
-        dt = dt.view(B, K, L, self.d_inner, K)
+        dt = self.dt_proj(dt)  # (B*K*L, d_inner)
+        dt = dt.view(B, K, L, self.d_inner)
 
         # Simplified SSM computation (approximation for when mamba_ssm is not available)
         # This is a placeholder - ideally should use the actual selective scan operation
-        A = -torch.exp(self.A_log.float())  # (C*K, d_state)
+        A = -torch.exp(self.A_log.float())  # (d_inner*K, d_state)
 
         # For simplicity, we'll use a gated attention-like mechanism
         # This maintains the spirit of state-space models while being PyTorch-native
-        out = xs.view(B, K, L, C)
+        out = xs  # (B, K, L, C)
 
         # Apply gating with learnable parameters
-        gate = torch.sigmoid(dt.mean(-1))  # (B, K, L, C)
-        out = out * gate + self.D.view(1, K, 1, -1).expand(B, K, L, self.d_inner) * out
+        gate = torch.sigmoid(dt)  # (B, K, L, d_inner)
+        D_expanded = self.D.view(self.K, self.d_inner)  # (K, d_inner)
+        out = out * gate + D_expanded.view(1, K, 1, self.d_inner) * out
 
         # Merge directions
-        out = out.mean(dim=1)  # (B, L, C)
+        out = out.mean(dim=1)  # (B, L, d_inner)
 
         return out
 

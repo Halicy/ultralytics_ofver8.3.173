@@ -1,0 +1,12 @@
+# 数据集根路径
+path: /home/zhangwellong/Projects/ultralytics_ofver8.3.173/data/class_A_single_640
+train: images/train
+val: images/val
+
+# 类别数量与名称
+nc: 2
+names:
+  0: harvestable_cucumber
+  1: no_harvestable_cucumber
+
+# NOTE: training commands are documented elsewhere; this YAML must remain pure config.
