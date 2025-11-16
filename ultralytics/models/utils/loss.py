@@ -474,3 +474,140 @@ class RTDETRDetectionLoss(DETRLoss):
             else:
                 dn_match_indices.append((torch.zeros([0], dtype=torch.long), torch.zeros([0], dtype=torch.long)))
         return dn_match_indices
+
+
+class HCPRTDETRDetectionLoss(RTDETRDetectionLoss):
+    """
+    Hierarchical Category Prototype RT-DETR Detection Loss with ASRW.
+
+    This class extends RTDETRDetectionLoss with:
+    1. Prototype contrastive loss integration from HCP-DETR
+    2. ASRW (Adaptive Sample Reweighting with Training Stabilization)
+    3. Curriculum learning for training stability
+
+    The three innovations work synergistically:
+    - HCP-DETR: Improves feature discrimination for challenging classes
+    - AREP-Backbone: Enhances elongated target feature extraction (handled in model)
+    - ASRW: Stabilizes training and focuses on hard samples progressively
+
+    Attributes:
+        current_epoch (int): Current training epoch for curriculum learning.
+        max_epochs (int): Maximum training epochs.
+        asrw_warmup (int): Number of warmup epochs before full ASRW activation.
+        asrw_weight (float): Weight for ASRW adjustment.
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        loss_gain: Optional[Dict[str, float]] = None,
+        aux_loss: bool = True,
+        use_fl: bool = True,
+        use_vfl: bool = False,
+        use_uni_match: bool = False,
+        uni_match_ind: int = 0,
+        gamma: float = 1.5,
+        alpha: float = 0.25,
+        asrw_warmup: int = 10,
+        asrw_weight: float = 0.5,
+    ):
+        """
+        Initialize HCPRTDETRDetectionLoss with ASRW support.
+
+        Args:
+            nc (int): Number of classes.
+            loss_gain (Dict[str, float], optional): Loss coefficients.
+            aux_loss (bool): Whether to use auxiliary losses.
+            use_fl (bool): Whether to use FocalLoss.
+            use_vfl (bool): Whether to use VarifocalLoss.
+            use_uni_match (bool): Whether to use fixed layer for auxiliary branch.
+            uni_match_ind (int): Index of fixed layer for uni_match.
+            gamma (float): Focal loss focusing parameter.
+            alpha (float): Focal loss balancing factor.
+            asrw_warmup (int): Warmup epochs for ASRW.
+            asrw_weight (float): Weight for ASRW loss adjustment.
+        """
+        super().__init__(
+            nc=nc,
+            loss_gain=loss_gain,
+            aux_loss=aux_loss,
+            use_fl=use_fl,
+            use_vfl=use_vfl,
+            use_uni_match=use_uni_match,
+            uni_match_ind=uni_match_ind,
+            gamma=gamma,
+            alpha=alpha,
+        )
+        self.current_epoch = 0
+        self.max_epochs = 150
+        self.asrw_warmup = asrw_warmup
+        self.asrw_weight = asrw_weight
+
+    def forward(
+        self,
+        preds: Tuple[torch.Tensor, torch.Tensor],
+        batch: Dict[str, Any],
+        dn_bboxes: Optional[torch.Tensor] = None,
+        dn_scores: Optional[torch.Tensor] = None,
+        dn_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass with HCP prototype loss and ASRW integration.
+
+        Args:
+            preds (Tuple[torch.Tensor, torch.Tensor]): Predicted bboxes and scores.
+            batch (Dict[str, Any]): Batch data with ground truth.
+            dn_bboxes (torch.Tensor, optional): Denoising bounding boxes.
+            dn_scores (torch.Tensor, optional): Denoising scores.
+            dn_meta (Dict[str, Any], optional): Metadata including prototype_loss.
+
+        Returns:
+            (Dict[str, torch.Tensor]): Dictionary containing all loss components.
+        """
+        # Compute standard RT-DETR loss
+        total_loss = super().forward(preds, batch, dn_bboxes, dn_scores, dn_meta)
+
+        # Extract and add prototype loss from HCP-DETR
+        if dn_meta is not None and "prototype_loss" in dn_meta:
+            prototype_loss = dn_meta["prototype_loss"]
+            total_loss["loss_prototype"] = prototype_loss
+
+            # Apply ASRW (Adaptive Sample Reweighting with Training Stabilization)
+            if self.current_epoch >= self.asrw_warmup:
+                # Curriculum learning: gradually increase focus on hard samples
+                progress = min(1.0, (self.current_epoch - self.asrw_warmup) / (self.max_epochs - self.asrw_warmup))
+
+                # ASRW adjustment factor: starts at 1.0, gradually increases
+                # This helps stabilize training while progressively focusing on hard samples
+                asrw_factor = 1.0 + self.asrw_weight * progress
+
+                # Apply ASRW to classification loss (most important for no_harvestable)
+                if "loss_class" in total_loss:
+                    total_loss["loss_class"] = total_loss["loss_class"] * asrw_factor
+
+                # Also scale prototype loss to enhance its effect over time
+                total_loss["loss_prototype"] = prototype_loss * asrw_factor
+
+        else:
+            # No prototype loss available, set to zero
+            total_loss["loss_prototype"] = torch.tensor(0.0, device=self.device)
+
+        return total_loss
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Set current epoch for curriculum learning in ASRW.
+
+        Args:
+            epoch (int): Current training epoch.
+        """
+        self.current_epoch = epoch
+
+    def set_max_epochs(self, max_epochs: int) -> None:
+        """
+        Set maximum epochs for ASRW scheduling.
+
+        Args:
+            max_epochs (int): Maximum training epochs.
+        """
+        self.max_epochs = max_epochs

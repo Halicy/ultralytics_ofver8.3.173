@@ -1398,7 +1398,12 @@ class HCPRTDETRDecoder(RTDETRDecoder):
             # We use the embeddings from decoder for prototype learning
             prototype_loss = self._compute_prototype_loss(embed, batch)
 
-        x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta, prototype_loss
+        # Add prototype_loss to dn_meta to maintain compatibility with RTDETRDetectionModel.loss()
+        if dn_meta is None:
+            dn_meta = {}
+        dn_meta["prototype_loss"] = prototype_loss
+
+        x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
         if self.training:
             return x
 
