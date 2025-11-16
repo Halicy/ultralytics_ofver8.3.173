@@ -68,6 +68,10 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    EfficientVMambaBlock,
+    EfficientVMambaStage,
+    EfficientVMambaStem,
+    EfficientVMambaBackbone,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1708,6 +1712,25 @@ def parse_model(d, ch, verbose=True):
             if m is HGBlock:
                 args.insert(4, n)  # number of repeats
                 n = 1
+        elif m in frozenset({EfficientVMambaStem, EfficientVMambaBlock, EfficientVMambaStage}):
+            # EfficientVMamba modules
+            c1 = ch[f]
+            if m is EfficientVMambaStem:
+                # Stem: c1 (input) -> c2 (output)
+                c2 = args[0]  # output channels
+                args = [c1, c2]
+            elif m is EfficientVMambaBlock:
+                # Block: maintains channel dimension
+                c2 = args[0]  # dim (same as c1 usually)
+                args = [c2, *args[1:]]  # dim, depth, ...
+            elif m is EfficientVMambaStage:
+                # Stage: c1 -> c2 with optional downsampling
+                c2 = args[0]  # output channels
+                args = [c1, c2, *args[1:]]  # c1, c2, depth, ...
+        elif m is EfficientVMambaBackbone:
+            # Full backbone module (outputs list of features)
+            c2 = args[0] if args else 768  # default to small variant output
+            args = args if args else ["S"]
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:

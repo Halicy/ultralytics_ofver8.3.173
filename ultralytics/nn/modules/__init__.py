@@ -60,6 +60,14 @@ from .block import (
     SCDown,
     TorchVision,
 )
+from .efficientvmamba import (
+    EfficientVMambaBlock,
+    EfficientVMambaStage,
+    EfficientVMambaStem,
+    EfficientVMambaBackbone,
+    SS2D,
+    VSSBlock,
+)
 from .conv import (
     CBAM,
     ChannelAttention,
@@ -179,4 +187,10 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "EfficientVMambaBlock",
+    "EfficientVMambaStage",
+    "EfficientVMambaStem",
+    "EfficientVMambaBackbone",
+    "SS2D",
+    "VSSBlock",
 )
